@@ -78,6 +78,79 @@ def so3_error_vee(R: torch.Tensor, R_d: torch.Tensor) -> torch.Tensor:
     return vee(e_R_mat)
 
 
+# -----------------------------
+# ZXY helpers (yaw->roll->pitch)
+# -----------------------------
+def rotmat_from_euler_zxy(yaw: torch.Tensor, roll: torch.Tensor, pitch: torch.Tensor) -> torch.Tensor:
+    """
+    R = Rz(yaw) * Rx(roll) * Ry(pitch)
+    yaw: (N,)
+    roll:(N,)
+    pitch:(N,)
+    return: (N,3,3)
+    """
+    cy, sy = torch.cos(yaw), torch.sin(yaw)
+    cr, sr = torch.cos(roll), torch.sin(roll)
+    cp, sp = torch.cos(pitch), torch.sin(pitch)
+
+    z0 = torch.zeros_like(cy)
+    o1 = torch.ones_like(cy)
+
+    # Rz
+    Rz = torch.stack(
+        [
+            torch.stack([cy, -sy, z0], dim=-1),
+            torch.stack([sy,  cy, z0], dim=-1),
+            torch.stack([z0,  z0, o1], dim=-1),
+        ],
+        dim=-2,
+    )
+
+    # Rx
+    Rx = torch.stack(
+        [
+            torch.stack([o1, z0, z0], dim=-1),
+            torch.stack([z0, cr, -sr], dim=-1),
+            torch.stack([z0, sr,  cr], dim=-1),
+        ],
+        dim=-2,
+    )
+
+    # Ry
+    Ry = torch.stack(
+        [
+            torch.stack([cp, z0, sp], dim=-1),
+            torch.stack([z0, o1, z0], dim=-1),
+            torch.stack([-sp, z0, cp], dim=-1),
+        ],
+        dim=-2,
+    )
+
+    return torch.bmm(torch.bmm(Rz, Rx), Ry)
+
+
+def euler_zxy_from_rotmat(R: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Inverse of R = Rz(yaw)*Rx(roll)*Ry(pitch)
+    Using:
+      roll  = asin(R[2,1])
+      yaw   = atan2(-R[0,1], R[1,1])
+      pitch = atan2(-R[2,0], R[2,2])
+    """
+    r21 = R[:, 2, 1].clamp(-1.0, 1.0)
+    roll = torch.asin(r21)
+
+    yaw = torch.atan2(-R[:, 0, 1], R[:, 1, 1])
+    pitch = torch.atan2(-R[:, 2, 0], R[:, 2, 2])
+
+    return wrap_pi(yaw), wrap_pi(roll), wrap_pi(pitch)
+
+
+def euler_zxy_from_quat_wxyz(q_wxyz: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    R = math_utils.matrix_from_quat(q_wxyz)  # (N,3,3)
+    return euler_zxy_from_rotmat(R)
+
+
 class MtrlAmEnv(DirectRLEnv):
     cfg: MtrlAmEnvCfg
 
@@ -93,7 +166,7 @@ class MtrlAmEnv(DirectRLEnv):
 
         super().__init__(cfg, render_mode, **kwargs)
 
-        # policy/controller == simulation Hz (decimation=1 전제)
+        # policy/controller == simulation Hz
         self._dt = float(cfg.sim.dt)
 
         # DH params
@@ -126,42 +199,45 @@ class MtrlAmEnv(DirectRLEnv):
         # allocation matrices
         self.D, self.G, self.B_inv = build_allocation_mat(cfg, device=self.device)
 
-        # init pose
+        # init pose (ZXY: yaw, roll, pitch)
         self._init_pos = torch.tensor(cfg.init_pos, device=self.device, dtype=torch.float32).view(1, 3)
-        r0, p0, y0 = cfg.init_euler_xyz
-        rr0 = torch.full((self.num_envs,), float(r0), device=self.device, dtype=torch.float32)
-        pp0 = torch.full((self.num_envs,), float(p0), device=self.device, dtype=torch.float32)
-        yy0 = torch.full((self.num_envs,), float(y0), device=self.device, dtype=torch.float32)
-        self._init_quat = math_utils.quat_unique(math_utils.quat_from_euler_xyz(rr0, pp0, yy0))  # wxyz
+        yaw0, roll0, pitch0 = cfg.init_euler_zxy
+        yy0 = torch.full((self.num_envs,), float(yaw0), device=self.device, dtype=torch.float32)
+        rr0 = torch.full((self.num_envs,), float(roll0), device=self.device, dtype=torch.float32)
+        pp0 = torch.full((self.num_envs,), float(pitch0), device=self.device, dtype=torch.float32)
+        R0 = rotmat_from_euler_zxy(yy0, rr0, pp0)
+        self._init_quat = math_utils.quat_unique(quat_from_rotmat_wxyz(R0))  # wxyz
 
-        # goal buffers
+        # goal buffers (ZXY: yaw, roll, pitch)
         self._ee_goal_pos = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
         self._ee_goal_quat = torch.zeros((self.num_envs, 4), device=self.device, dtype=torch.float32)
-        self._ee_goal_rpy = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
+        self._ee_goal_zxy = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)  # (yaw, roll, pitch)
 
         self._ee_goal_pos_fixed = (
             torch.tensor(cfg.ee_target_pos, device=self.device, dtype=torch.float32).view(1, 3).repeat(self.num_envs, 1)
         )
-        r_fix, p_fix, y_fix = cfg.ee_target_euler_xyz
-        self._ee_goal_rpy_fixed = (
-            torch.tensor((float(r_fix), float(p_fix), float(y_fix)), device=self.device, dtype=torch.float32)
+        yaw_fix, roll_fix, pitch_fix = cfg.ee_target_euler_zxy
+        self._ee_goal_zxy_fixed = (
+            torch.tensor((float(yaw_fix), float(roll_fix), float(pitch_fix)), device=self.device, dtype=torch.float32)
             .view(1, 3)
             .repeat(self.num_envs, 1)
         )
-        rr = self._ee_goal_rpy_fixed[:, 0]
-        pp = self._ee_goal_rpy_fixed[:, 1]
-        yy = self._ee_goal_rpy_fixed[:, 2]
-        self._ee_goal_quat_fixed = math_utils.quat_unique(math_utils.quat_from_euler_xyz(rr, pp, yy))
+        R_fix = rotmat_from_euler_zxy(self._ee_goal_zxy_fixed[:, 0], self._ee_goal_zxy_fixed[:, 1], self._ee_goal_zxy_fixed[:, 2])
+        self._ee_goal_quat_fixed = math_utils.quat_unique(quat_from_rotmat_wxyz(R_fix))
 
         # action buffers
         self.actions = torch.zeros((self.num_envs, cfg.action_space), device=self.device, dtype=torch.float32)
         self._prev_actions = torch.zeros_like(self.actions)
         self._motor_thrusts = torch.zeros((self.num_envs, 4), device=self.device, dtype=torch.float32)
 
-        # desired EE state (RAW: policy 적분 상태)  --- LPF 제거: RAW를 그대로 사용
+        # desired RAW:
+        #  - EE desired position in world
+        #  - joint desired (roll,pitch 역할)
+        #  - base yaw desired
         self._ee_des_pos = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
-        self._ee_des_rpy = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)  # roll,pitch,yaw (raw)
         self._q_des = torch.zeros((self.num_envs, 2), device=self.device, dtype=torch.float32)  # joint1, joint2 (raw)
+        self._base_yaw_des = torch.zeros((self.num_envs,), device=self.device, dtype=torch.float32)
+        self._ee_des_zxy = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)  # (yaw, roll, pitch) for debug/consistency
 
         # finite diff prev states (for v_ref/a_ref/yaw_rate_ref)
         self._base_pos_ref_prev = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
@@ -192,21 +268,23 @@ class MtrlAmEnv(DirectRLEnv):
         self._q_des.copy_(q_act_12)
 
         _, base_quat, _, _ = self._get_body_state(self._base_body_id)
-        _, _, yaw0 = math_utils.euler_xyz_from_quat(base_quat)
-        yaw0 = torch.nan_to_num(yaw0, nan=0.0, posinf=0.0, neginf=0.0)
-        self._ee_des_rpy[:, 0] = self._q_des[:, 0]
-        self._ee_des_rpy[:, 1] = self._q_des[:, 1]
-        self._ee_des_rpy[:, 2] = yaw0
+        yaw_base, _, _ = euler_zxy_from_quat_wxyz(base_quat)  # ZXY yaw
+        yaw_base = torch.nan_to_num(yaw_base, nan=0.0, posinf=0.0, neginf=0.0)
+        self._base_yaw_des.copy_(yaw_base)
+
+        self._ee_des_zxy[:, 0] = self._base_yaw_des
+        self._ee_des_zxy[:, 1] = self._q_des[:, 0]  # roll
+        self._ee_des_zxy[:, 2] = self._q_des[:, 1]  # pitch
 
         # initial goal sampling
         self._resample_ee_goal(env_ids=torch.arange(self.num_envs, device=self.device, dtype=torch.long))
 
         # ---- init prev refs to avoid first finite-diff spike ----
-        ee_des_pos_W0, ee_des_quat_W0 = self._compute_desired_ee_pose_world(env_ids=None)  # RAW 기반
+        ee_des_pos_W0, ee_des_quat_W0 = self._compute_desired_ee_pose_world(env_ids=None)
         base_pos_ref0, base_quat_ref0, yaw_ref0 = self._compute_base_ref_pose_only(
             ee_pos_des_W=ee_des_pos_W0,
-            ee_quat_des_W=ee_des_quat_W0,
-            q_joint_12=self.robot.data.joint_pos[:, self._joint_ids].to(dtype=ee_des_pos_W0.dtype),
+            q_joint_12=self._q_des.to(dtype=ee_des_pos_W0.dtype),
+            base_yaw_des=self._base_yaw_des.to(dtype=ee_des_pos_W0.dtype),
         )
         self._base_pos_ref_prev.copy_(base_pos_ref0)
         self._base_vel_ref_prev.zero_()
@@ -260,11 +338,6 @@ class MtrlAmEnv(DirectRLEnv):
     # RL loop
     # -----------------------------
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        """
-        decimation=1 전제:
-          - 여기서는 "액션 저장 + 클램프 + prev_action 갱신"만 수행
-          - desired/ref 계산 및 컨트롤 입력 생성은 _apply_action()에서 수행
-        """
         self._prev_actions.copy_(self.actions)
 
         if actions is None or actions.numel() == 0:
@@ -288,12 +361,7 @@ class MtrlAmEnv(DirectRLEnv):
         self.actions = torch.clamp(actions, -1.0, 1.0)
 
     def _apply_action(self) -> None:
-        """
-        action 처리(=desired 업데이트) + ref 계산 + controller + actuator 적용
-        -> 전부 simulation step마다 수행
-        (LPF 제거: RAW desired를 그대로 사용)
-        """
-        # 1) action -> raw desired integrate
+        # 1) action -> raw desired integrate (ZXY 기준)
         self._update_desired_from_action()
 
         # 2) raw desired -> refs (and store for obs/vis)
@@ -330,7 +398,7 @@ class MtrlAmEnv(DirectRLEnv):
             ee_fk_quat = math_utils.quat_unique(quat_from_rotmat_wxyz(T_W_E_fk[:, 0:3, 0:3]))
             self._vis_ee_fk.visualize(ee_fk_pos, ee_fk_quat, marker_indices=self._marker_indices_frame)
 
-        # 5) controller
+        # 5) controller (yaw_ref만 사용해서 desired attitude 구성됨)
         u = self._geometric_controller(
             pos_I=base_pos,
             quat_I=base_quat,
@@ -364,10 +432,6 @@ class MtrlAmEnv(DirectRLEnv):
         self.robot.set_joint_position_target(target=joint_target)
 
     def _get_observations(self) -> dict:
-        """
-        - 남기는 항목(ee pos err, ee rot err, ee linvel, ee angvel, base linvel, base angvel)은 모두 base frame 기준
-        - 추가: prev_action, base 자세(base quat wxyz in world), base frame 기준의 ee goal pose(pos+quat)
-        """
         ee_pos_W, ee_quat_W, ee_linvel_W, ee_angvel_W = self._get_body_state(self._ee_body_id)
         base_pos_W, base_quat_W, base_linvel_W, base_angvel_W = self._get_body_state(self._base_body_id)
 
@@ -390,9 +454,7 @@ class MtrlAmEnv(DirectRLEnv):
         R_goal_B = torch.bmm(R_BW, R_goal_W)   # R_BGoal
         ee_rot_err_goal_B = so3_error_vee(R=R_ee_B, R_d=R_goal_B)
 
-        # 3) velocities -> base frame (표현만 base frame으로 회전)
-        ee_linvel_B = _w_to_b(ee_linvel_W)
-        ee_angvel_B = _w_to_b(ee_angvel_W)
+        # 3) velocities -> base frame
         base_linvel_B = _w_to_b(base_linvel_W)
         base_angvel_B = _w_to_b(base_angvel_W)
 
@@ -405,22 +467,19 @@ class MtrlAmEnv(DirectRLEnv):
         goal_quat_B = math_utils.quat_unique(quat_from_rotmat_wxyz(R_goal_B))
 
         prev_act = self._prev_actions
-
         joint_angle = self.robot.data.joint_pos[:, self._joint_ids].to(dtype=ee_pos_err_B.dtype)
 
         obs = torch.cat(
             [
                 ee_pos_err_B,          # 3
                 ee_rot_err_goal_B,     # 3
-                ee_linvel_B,           # 3
-                ee_angvel_B,           # 3
                 base_linvel_B,         # 3
                 base_angvel_B,         # 3
-                base_quat_obs,         # 4 (wxyz, world)
-                goal_pos_rel_B,        # 3 (base frame)
-                goal_quat_B,           # 4 (wxyz, base frame)
+                base_quat_obs,         # 4
+                goal_pos_rel_B,        # 3
+                goal_quat_B,           # 4
                 joint_angle,           # 2
-                prev_act,              # action_space (기본 6)
+                prev_act,              # 6
             ],
             dim=-1,
         )
@@ -430,27 +489,18 @@ class MtrlAmEnv(DirectRLEnv):
 
     def _get_rewards(self) -> torch.Tensor:
         ee_pos_W, ee_quat_W, _, _ = self._get_body_state(self._ee_body_id)
+        base_pos_W, base_quat_W, _, _ = self._get_body_state(self._base_body_id)
 
-        # desired EE pose (world)
         ee_des_pos_W = self._ee_des_pos_W
         ee_des_quat_W = self._ee_des_quat_W
 
-        # desired mixing weight (cfg에서 조절)
         alpha = float(getattr(self.cfg, "reward_des_weight", 0.1))
-        alpha = float(max(0.0, min(1.0, alpha)))  # clamp [0,1]
+        alpha = float(max(0.0, min(1.0, alpha)))
 
-        # --------------------
-        # position errors
-        # --------------------
         pos_err2_act = torch.sum((ee_pos_W - self._ee_goal_pos) ** 2, dim=-1)
         pos_err2_des = torch.sum((ee_des_pos_W - self._ee_goal_pos) ** 2, dim=-1)
 
-        # --------------------
         # quaternion-based attitude errors (swing/twist about world Z)
-        #   - yaw:   twist component around world z-axis
-        #   - r/p:   swing component (yaw removed)
-        # error metric: err = 1 - |<q1,q2>|^2  in [0,1]
-        # --------------------
         def _quat_normalize(q: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
             return q / (torch.linalg.norm(q, dim=-1, keepdim=True) + eps)
 
@@ -475,30 +525,26 @@ class MtrlAmEnv(DirectRLEnv):
 
         def _swing_z(q: torch.Tensor) -> torch.Tensor:
             t = _twist_z(q)
-            return _quat_mul(_quat_normalize(q), _quat_conj(t))  # swing = q * t^{-1}
+            return _quat_mul(_quat_normalize(q), _quat_conj(t))
 
         def _quat_err01(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
             q1 = _quat_normalize(q1)
             q2 = _quat_normalize(q2)
             dot = torch.sum(q1 * q2, dim=-1)
             dot_abs = torch.abs(dot).clamp(0.0, 1.0)
-            return 1.0 - dot_abs * dot_abs  # [0,1]
+            return 1.0 - dot_abs * dot_abs
 
-        q_goal = self._ee_goal_quat  # wxyz, world
+        q_goal = self._ee_goal_quat
 
-        # actual
         yaw_err2_act = _quat_err01(_twist_z(ee_quat_W), _twist_z(q_goal))
         rp_err2_act  = _quat_err01(_swing_z(ee_quat_W), _swing_z(q_goal))
 
-        # desired
         yaw_err2_des = _quat_err01(_twist_z(ee_des_quat_W), _twist_z(q_goal))
         rp_err2_des  = _quat_err01(_swing_z(ee_des_quat_W), _swing_z(q_goal))
 
-        # action smoothing: ||a_t - a_{t-1}||^2 (그대로)
         da = self.actions - self._prev_actions
         act_diff2 = torch.sum(da * da, dim=-1)
 
-        # ---- numeric safety ----
         pos_err2_act = torch.nan_to_num(pos_err2_act, nan=1e6, posinf=1e6, neginf=1e6)
         pos_err2_des = torch.nan_to_num(pos_err2_des, nan=1e6, posinf=1e6, neginf=1e6)
         rp_err2_act  = torch.nan_to_num(rp_err2_act,  nan=1.0, posinf=1.0, neginf=1.0)
@@ -507,34 +553,60 @@ class MtrlAmEnv(DirectRLEnv):
         yaw_err2_des = torch.nan_to_num(yaw_err2_des, nan=1.0, posinf=1.0, neginf=1.0)
         act_diff2    = torch.nan_to_num(act_diff2,    nan=1e6, posinf=1e6, neginf=1e6)
 
-        # ---- exp(-x) reward terms ----
         s_pos = float(getattr(self.cfg, "exp_pos_scale", 1.0))
         s_rp  = float(getattr(self.cfg, "exp_rp_scale", 1.0))
-        s_yaw = float(getattr(self.cfg, "exp_yaw_scale", 1.0))
+        s_yaw = float(getattr(self.cfg, "exp_yaw_scale", 0.1))
         s_act = float(getattr(self.cfg, "exp_action_smooth_scale", 0.1))
 
-        # desired mixing: (1-alpha)*actual + alpha*desired
         r_pos = (1.0 - alpha) * torch.exp(-s_pos * pos_err2_act) + alpha * torch.exp(-s_pos * pos_err2_des)
         r_rp  = (1.0 - alpha) * torch.exp(-s_rp  * rp_err2_act)  + alpha * torch.exp(-s_rp  * rp_err2_des)
         r_yaw = (1.0 - alpha) * torch.exp(-s_yaw * yaw_err2_act) + alpha * torch.exp(-s_yaw * yaw_err2_des)
 
-        # smoothing 그대로
         r_smooth = torch.exp(-s_act * act_diff2)
 
-        # ---- weights ----
         w_pos    = float(getattr(self.cfg, "w_ee_pos", 1.0))
         w_rp     = float(getattr(self.cfg, "w_ee_rp", 1.0))
         w_yaw    = float(getattr(self.cfg, "w_ee_yaw", 1.0))
         w_smooth = float(getattr(self.cfg, "w_action_smooth", 1.0))
 
-        w = torch.tensor([w_pos, w_rp, w_yaw, w_smooth], device=ee_pos_W.device, dtype=ee_pos_W.dtype)
-        r = w[0] * r_pos + w[1] * r_rp + w[2] * r_yaw + w[3] * r_smooth
+        # --------------------
+        # base tracking errors (actual vs ref)
+        # --------------------
+        base_pos_err2 = torch.sum((base_pos_W - self._base_pos_ref) ** 2, dim=-1)
+
+        # yaw from ZXY (helper already in file)
+        yaw_act, _, _ = euler_zxy_from_quat_wxyz(base_quat_W)
+        yaw_err = wrap_pi(yaw_act - self._yaw_ref)
+        yaw_err2 = yaw_err * yaw_err
+
+        base_pos_err2 = torch.nan_to_num(base_pos_err2, nan=1e6, posinf=1e6, neginf=1e6)
+        yaw_err2 = torch.nan_to_num(yaw_err2, nan=1e6, posinf=1e6, neginf=1e6)
+
+        s_bpos = float(getattr(self.cfg, "exp_base_pos_scale", 1.0))
+        s_byaw = float(getattr(self.cfg, "exp_base_yaw_scale", 1.0))
+
+        r_bpos = torch.exp(-s_bpos * base_pos_err2)
+        r_byaw = torch.exp(-s_byaw * yaw_err2)
+
+        w_bpos = float(getattr(self.cfg, "w_base_pos", 0.0))
+        w_byaw = float(getattr(self.cfg, "w_base_yaw", 0.0))
+
+        w = torch.tensor([w_pos, w_rp, w_yaw, w_smooth, w_bpos, w_byaw],
+                        device=ee_pos_W.device, dtype=ee_pos_W.dtype)
+
+        r = (
+            w[0] * r_pos
+            + w[1] * r_rp
+            + w[2] * r_yaw
+            + w[3] * r_smooth
+            + w[4] * r_bpos
+            + w[5] * r_byaw
+        )
 
         terminated, _ = self._get_dones()
         r = r * (~terminated).to(dtype=r.dtype)
 
         return torch.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
-
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -595,23 +667,18 @@ class MtrlAmEnv(DirectRLEnv):
         self._q_des[env_ids] = q_act[env_ids].clone()
 
         _, base_quat, _, _ = self._get_body_state(self._base_body_id)
-        _, _, yaw_base = math_utils.euler_xyz_from_quat(base_quat)
-        self._ee_des_rpy[env_ids, 0] = self._q_des[env_ids, 0]
-        self._ee_des_rpy[env_ids, 1] = self._q_des[env_ids, 1]
-        self._ee_des_rpy[env_ids, 2] = yaw_base[env_ids]
+        yaw_base, _, _ = euler_zxy_from_quat_wxyz(base_quat)
+        self._base_yaw_des[env_ids] = yaw_base[env_ids].clone()
+
+        self._ee_des_zxy[env_ids, 0] = self._base_yaw_des[env_ids]
+        self._ee_des_zxy[env_ids, 1] = self._q_des[env_ids, 0]
+        self._ee_des_zxy[env_ids, 2] = self._q_des[env_ids, 1]
 
         # reset prev refs to avoid finite-diff spike
-        ee_des_quat_sub = math_utils.quat_unique(
-            math_utils.quat_from_euler_xyz(
-                self._ee_des_rpy[env_ids, 0],
-                self._ee_des_rpy[env_ids, 1],
-                self._ee_des_rpy[env_ids, 2],
-            )
-        )
         base_pos_ref_sub, base_quat_ref_sub, yaw_ref_sub = self._compute_base_ref_pose_only(
             ee_pos_des_W=self._ee_des_pos[env_ids],
-            ee_quat_des_W=ee_des_quat_sub,
-            q_joint_12=self.robot.data.joint_pos[:, self._joint_ids][env_ids].to(dtype=self._ee_des_pos.dtype),
+            q_joint_12=self._q_des[env_ids].to(dtype=self._ee_des_pos.dtype),
+            base_yaw_des=self._base_yaw_des[env_ids].to(dtype=self._ee_des_pos.dtype),
         )
         self._base_pos_ref_prev[env_ids] = base_pos_ref_sub
         self._base_vel_ref_prev[env_ids] = 0.0
@@ -632,35 +699,30 @@ class MtrlAmEnv(DirectRLEnv):
 
     def _update_desired_from_action(self) -> None:
         """
-        action -> (scaled) increment -> integrate into RAW desired
-        (policy/controller == sim Hz이므로 step마다 수행)
-
-        ✅ 변경점:
-          - actions[:,0:3]을 "base frame 기준 Δpos"로 해석
-          - 현재 base attitude(R_WB)로 회전시켜 world Δpos로 만든 뒤 self._ee_des_pos에 적분
+        ✅ ZXY 기준:
+          - actions[:,0:3] : base frame 기준 Δpos
+          - actions[:,3]   : Δroll (joint1)
+          - actions[:,4]   : Δpitch (joint2)
+          - actions[:,5]   : Δyaw (base_yaw_des)
         """
-        # (B-frame) delta position from action
         dpos_B = float(self.cfg.dpos_scale) * self.actions[:, 0:3]
 
         droll = float(getattr(self.cfg, "droll_scale", 0.1)) * self.actions[:, 3]
         dpitch = float(getattr(self.cfg, "dpitch_scale", 0.1)) * self.actions[:, 4]
         dyaw = float(getattr(self.cfg, "dyaw_scale", 0.1)) * self.actions[:, 5]
 
-        # --- base frame -> world frame rotation for dpos ---
+        # base frame -> world frame rotation for dpos (실제 base 자세 사용)
         _, base_quat_W, _, _ = self._get_body_state(self._base_body_id)
-        R_WB = math_utils.matrix_from_quat(base_quat_W)  # base -> world, (N,3,3)
-
-        # dpos_W = R_WB * dpos_B
+        R_WB = math_utils.matrix_from_quat(base_quat_W)  # base -> world
         dpos_W = torch.bmm(R_WB, dpos_B.unsqueeze(-1)).squeeze(-1)
 
-        # integrate RAW desired EE position (in world)
+        # integrate EE desired position (world)
         self._ee_des_pos = self._ee_des_pos + dpos_W
 
-        # roll/pitch -> RAW joint targets
+        # joint desired
         self._q_des[:, 0] = self._q_des[:, 0] + droll
         self._q_des[:, 1] = self._q_des[:, 1] + dpitch
 
-        # clamp roll/pitch absolute limits
         self._q_des[:, 0] = torch.clamp(
             self._q_des[:, 0],
             float(getattr(self.cfg, "ee_target_roll_min", -PI * 7 / 18)),
@@ -672,50 +734,65 @@ class MtrlAmEnv(DirectRLEnv):
             float(getattr(self.cfg, "ee_target_pitch_max", +PI * 2 / 18)),
         )
 
-        # RAW yaw desired
-        self._ee_des_rpy[:, 2] = wrap_pi(self._ee_des_rpy[:, 2] + dyaw)
+        # yaw desired (Z)
+        self._base_yaw_des = wrap_pi(self._base_yaw_des + dyaw)
 
-        # keep RAW desired rpy consistent with RAW joints
-        self._ee_des_rpy[:, 0] = self._q_des[:, 0]
-        self._ee_des_rpy[:, 1] = self._q_des[:, 1]
+        # keep ZXY buffer consistent: (yaw, roll, pitch)
+        self._ee_des_zxy[:, 0] = self._base_yaw_des
+        self._ee_des_zxy[:, 1] = self._q_des[:, 0]
+        self._ee_des_zxy[:, 2] = self._q_des[:, 1]
 
         # safety
         self._ee_des_pos = torch.nan_to_num(self._ee_des_pos, nan=0.0, posinf=0.0, neginf=0.0)
         self._q_des = torch.nan_to_num(self._q_des, nan=0.0, posinf=0.0, neginf=0.0)
-        self._ee_des_rpy = torch.nan_to_num(self._ee_des_rpy, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _quat_from_raw_rpy(self, env_ids: torch.Tensor | None = None) -> torch.Tensor:
-        if env_ids is None:
-            r = self._ee_des_rpy[:, 0]
-            p = self._ee_des_rpy[:, 1]
-            y = self._ee_des_rpy[:, 2]
-        else:
-            r = self._ee_des_rpy[env_ids, 0]
-            p = self._ee_des_rpy[env_ids, 1]
-            y = self._ee_des_rpy[env_ids, 2]
-        return math_utils.quat_unique(math_utils.quat_from_euler_xyz(r, p, y))
+        self._base_yaw_des = torch.nan_to_num(self._base_yaw_des, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _compute_desired_ee_pose_world(self, env_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        LPF 제거: "des pose"는 RAW desired로 계산
+        EE desired quat도 ZXY 기준으로 일관 생성:
+          R_WE_des = R_WB(yaw-only) * R_BE(q_des)
         """
         if env_ids is None:
             ee_pos = self._ee_des_pos
-            ee_quat = self._quat_from_raw_rpy(env_ids=None)
+            q_des = self._q_des
+            yaw_des = self._base_yaw_des
         else:
             ee_pos = self._ee_des_pos[env_ids]
-            ee_quat = self._quat_from_raw_rpy(env_ids=env_ids)
+            q_des = self._q_des[env_ids]
+            yaw_des = self._base_yaw_des[env_ids]
+
+        dtype = ee_pos.dtype
+        device = ee_pos.device
+
+        # FK: base->ee (q_des)
+        T_B_E = fk_dh_T_base_to_ee_from_joints(
+            q_joint_12=q_des.to(device=device, dtype=dtype),
+            dh_params=self._dh_params.to(dtype=dtype),
+        )
+        R_BE = T_B_E[:, 0:3, 0:3]
+
+        # base yaw-only rotation
+        z0 = torch.zeros_like(yaw_des)
+        R_WB = rotmat_from_euler_zxy(
+            yaw=yaw_des.to(dtype=dtype),
+            roll=z0.to(dtype=dtype),
+            pitch=z0.to(dtype=dtype),
+        )
+
+        R_WE = torch.bmm(R_WB, R_BE)
+        ee_quat = math_utils.quat_unique(quat_from_rotmat_wxyz(R_WE))
         return ee_pos, ee_quat
 
     def _compute_and_store_refs(self, env_ids: torch.Tensor | None = None) -> None:
-        """
-        현재 RAW desired를 기준으로 base ref(및 v/a/yaw_rate)를 계산해서
-        obs/vis에서 쓰는 step buffer에 저장
-        """
         if env_ids is None:
             ee_des_pos_W, ee_des_quat_W = self._compute_desired_ee_pose_world(env_ids=None)
             base_pos_ref, base_quat_ref, base_vel_ref, base_acc_ref, yaw_ref, yaw_rate_ref = (
-                self._compute_base_ref_from_desired(ee_des_pos_W, ee_des_quat_W)
+                self._compute_base_ref_from_desired(
+                    ee_pos_des_W=ee_des_pos_W,
+                    q_joint_12=self._q_des.to(dtype=ee_des_pos_W.dtype),
+                    base_yaw_des=self._base_yaw_des.to(dtype=ee_des_pos_W.dtype),
+                    env_ids=None,
+                )
             )
 
             self._ee_des_pos_W.copy_(ee_des_pos_W)
@@ -729,10 +806,14 @@ class MtrlAmEnv(DirectRLEnv):
             self._yaw_rate_ref.copy_(yaw_rate_ref)
             return
 
-        # subset update (reset 시)
         ee_des_pos_W, ee_des_quat_W = self._compute_desired_ee_pose_world(env_ids=env_ids)
         base_pos_ref, base_quat_ref, base_vel_ref, base_acc_ref, yaw_ref, yaw_rate_ref = (
-            self._compute_base_ref_from_desired(ee_des_pos_W, ee_des_quat_W, env_ids=env_ids)
+            self._compute_base_ref_from_desired(
+                ee_pos_des_W=ee_des_pos_W,
+                q_joint_12=self._q_des[env_ids].to(dtype=ee_des_pos_W.dtype),
+                base_yaw_des=self._base_yaw_des[env_ids].to(dtype=ee_des_pos_W.dtype),
+                env_ids=env_ids,
+            )
         )
 
         self._ee_des_pos_W[env_ids] = ee_des_pos_W
@@ -748,23 +829,35 @@ class MtrlAmEnv(DirectRLEnv):
     def _compute_base_ref_pose_only(
         self,
         ee_pos_des_W: torch.Tensor,
-        ee_quat_des_W: torch.Tensor,
         q_joint_12: torch.Tensor,
+        base_yaw_des: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        ✅ 요청 반영:
+          - base ref 생성은 EE desired "position만" 사용
+          - 회전 정보는 (q_des, base_yaw_des)로 결정
+          - base attitude는 yaw-only로 둠
+          - base position은 p_B = p_E - Rz(yaw)*p_BE(q_des)
+        """
         dtype = ee_pos_des_W.dtype
-        T_W_E_des = tf_from_pos_quat_wxyz(ee_pos_des_W, ee_quat_des_W)
+        device = ee_pos_des_W.device
 
+        # FK base->ee
         T_B_E = fk_dh_T_base_to_ee_from_joints(
-            q_joint_12=q_joint_12.to(device=ee_pos_des_W.device, dtype=dtype),
+            q_joint_12=q_joint_12.to(device=device, dtype=dtype),
             dh_params=self._dh_params.to(dtype=dtype),
         )
-        T_E_B = tf_inv(T_B_E)
+        p_BE = T_B_E[:, 0:3, 3]  # in base frame
 
-        T_W_B_ref = torch.bmm(T_W_E_des, T_E_B)
-        base_pos_ref = T_W_B_ref[:, 0:3, 3]
-        base_quat_ref = math_utils.quat_unique(quat_from_rotmat_wxyz(T_W_B_ref[:, 0:3, 0:3]))
-
-        _, _, yaw_ref = math_utils.euler_xyz_from_quat(base_quat_ref)
+        z0 = torch.zeros_like(base_yaw_des)
+        R_WB = rotmat_from_euler_zxy(
+            yaw=base_yaw_des.to(dtype=dtype),
+            roll=z0.to(dtype=dtype),
+            pitch=z0.to(dtype=dtype),
+        )
+        base_pos_ref = ee_pos_des_W - torch.bmm(R_WB, p_BE.unsqueeze(-1)).squeeze(-1)
+        base_quat_ref = math_utils.quat_unique(quat_from_rotmat_wxyz(R_WB))
+        yaw_ref = wrap_pi(base_yaw_des.to(dtype=dtype))
 
         base_pos_ref = torch.nan_to_num(base_pos_ref, nan=0.0, posinf=0.0, neginf=0.0)
         base_quat_ref = torch.nan_to_num(base_quat_ref, nan=0.0, posinf=0.0, neginf=0.0)
@@ -774,47 +867,29 @@ class MtrlAmEnv(DirectRLEnv):
     def _compute_base_ref_from_desired(
         self,
         ee_pos_des_W: torch.Tensor,
-        ee_quat_des_W: torch.Tensor,
+        q_joint_12: torch.Tensor,
+        base_yaw_des: torch.Tensor,
         env_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        - policy/controller == sim Hz: dt = cfg.sim.dt
-        - base ref는 현재 관절 상태(q_act) 기준으로 계산
-        - v_ref/a_ref/yaw_rate_ref는 finite-diff raw
-        """
         dtype = ee_pos_des_W.dtype
         device = ee_pos_des_W.device
 
-        T_W_E_des = tf_from_pos_quat_wxyz(ee_pos_des_W, ee_quat_des_W)
-
-        # q_act 사용
         if env_ids is None:
-            q_for_ref = self.robot.data.joint_pos[:, self._joint_ids].to(device=device, dtype=dtype)
             base_pos_prev = self._base_pos_ref_prev
             base_vel_prev = self._base_vel_ref_prev
             yaw_prev = self._yaw_ref_prev
         else:
-            q_for_ref = self.robot.data.joint_pos[:, self._joint_ids][env_ids].to(device=device, dtype=dtype)
             base_pos_prev = self._base_pos_ref_prev[env_ids]
             base_vel_prev = self._base_vel_ref_prev[env_ids]
             yaw_prev = self._yaw_ref_prev[env_ids]
 
-        q_for_ref = torch.nan_to_num(q_for_ref, nan=0.0, posinf=0.0, neginf=0.0)
-
-        T_B_E = fk_dh_T_base_to_ee_from_joints(
-            q_joint_12=q_for_ref,
-            dh_params=self._dh_params.to(dtype=dtype),
+        base_pos_ref, base_quat_ref, yaw_ref = self._compute_base_ref_pose_only(
+            ee_pos_des_W=ee_pos_des_W,
+            q_joint_12=q_joint_12,
+            base_yaw_des=base_yaw_des,
         )
-        T_E_B = tf_inv(T_B_E)
-
-        T_W_B_ref = torch.bmm(T_W_E_des, T_E_B)
-        base_pos_ref = T_W_B_ref[:, 0:3, 3]
-        base_quat_ref = math_utils.quat_unique(quat_from_rotmat_wxyz(T_W_B_ref[:, 0:3, 0:3]))
-
-        _, _, yaw_ref = math_utils.euler_xyz_from_quat(base_quat_ref)
         yaw_ref = wrap_pi(yaw_ref)
 
-        # finite diff (raw)
         dt = max(self._dt, 1e-6)
         v_raw = (base_pos_ref - base_pos_prev) / dt
         a_raw = (v_raw - base_vel_prev) / dt
@@ -832,7 +907,6 @@ class MtrlAmEnv(DirectRLEnv):
             self._base_vel_ref_prev[env_ids] = v_raw
             self._yaw_ref_prev[env_ids] = yaw_ref
 
-        # safety
         base_pos_ref = torch.nan_to_num(base_pos_ref, nan=0.0, posinf=0.0, neginf=0.0)
         base_quat_ref = torch.nan_to_num(base_quat_ref, nan=0.0, posinf=0.0, neginf=0.0)
         v_raw = torch.nan_to_num(v_raw, nan=0.0, posinf=0.0, neginf=0.0)
@@ -847,35 +921,29 @@ class MtrlAmEnv(DirectRLEnv):
         if n == 0:
             return
 
-        # 각 env의 원점 (world 좌표)
-        env_origins = self.scene.env_origins[env_ids].to(device=self.device, dtype=torch.float32)  # (n,3)
+        env_origins = self.scene.env_origins[env_ids].to(device=self.device, dtype=torch.float32)
 
-        # ----------------------------
-        # Fixed goal (no randomization)
-        # ----------------------------
+        # Fixed goal
         if not bool(getattr(self.cfg, "randomize_ee_target", True)):
-            # fixed pos/rpy/quaternion을 env origin 기준으로 이동
             self._ee_goal_pos[env_ids] = env_origins + self._ee_goal_pos_fixed[env_ids]
-            self._ee_goal_rpy[env_ids] = self._ee_goal_rpy_fixed[env_ids]
+            self._ee_goal_zxy[env_ids] = self._ee_goal_zxy_fixed[env_ids]
             self._ee_goal_quat[env_ids] = self._ee_goal_quat_fixed[env_ids]
             return
 
-        # ----------------------------
-        # Random goal (randomization)
-        # ----------------------------
-        # position: [0,1) 샘플 + z_offset, 그리고 env origin 더하기
+        # Random goal position
         u = torch.rand((n, 3), device=self.device, dtype=torch.float32)
         u[:, 2] += float(self.cfg.z_offset)
         self._ee_goal_pos[env_ids] = env_origins + u
 
-        # yaw: uniform [min, max]
+        # yaw(z) uniform
         yaw = (
             float(self.cfg.ee_target_yaw_min)
             + (float(self.cfg.ee_target_yaw_max) - float(self.cfg.ee_target_yaw_min))
             * torch.rand((n,), device=self.device, dtype=torch.float32)
         )
+        yaw = wrap_pi(yaw)
 
-        # roll/pitch: 옵션에 따라 random 또는 0
+        # roll(x), pitch(y)
         if bool(getattr(self.cfg, "randomize_goal_roll_pitch", False)):
             roll = (
                 float(self.cfg.ee_target_roll_min)
@@ -891,17 +959,14 @@ class MtrlAmEnv(DirectRLEnv):
             roll = torch.zeros((n,), device=self.device, dtype=torch.float32)
             pitch = torch.zeros((n,), device=self.device, dtype=torch.float32)
 
-        self._ee_goal_rpy[env_ids, 0] = roll
-        self._ee_goal_rpy[env_ids, 1] = pitch
-        self._ee_goal_rpy[env_ids, 2] = wrap_pi(yaw)
+        # store ZXY
+        self._ee_goal_zxy[env_ids, 0] = yaw
+        self._ee_goal_zxy[env_ids, 1] = roll
+        self._ee_goal_zxy[env_ids, 2] = pitch
 
-        q = math_utils.quat_unique(
-            math_utils.quat_from_euler_xyz(
-                roll,
-                pitch,
-                self._ee_goal_rpy[env_ids, 2],
-            )
-        )
+        # quat from ZXY
+        R = rotmat_from_euler_zxy(yaw, roll, pitch)
+        q = math_utils.quat_unique(quat_from_rotmat_wxyz(R))
         self._ee_goal_quat[env_ids] = q
 
     # -----------------------------

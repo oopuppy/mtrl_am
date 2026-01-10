@@ -25,20 +25,23 @@ class MtrlAmEnvCfg(DirectRLEnvCfg):
     # -----------------
     # env
     # -----------------
-    # policy/controller == simulation Hz 전제
     decimation = 1
-    episode_length_s = 10.0
-    num_envs = 2048
+    episode_length_s = 30.0
+    num_envs = 1
 
     action_space = 6
-    observation_space = 37
+
+    # obs dim = 39 (현재 env 코드 기준)
+    observation_space = 39
     state_space = 0
 
     # -----------------
     # task goal (EE full pose goal) - reward용
     # -----------------
     ee_target_pos = (0.3, 0.0, 1.1)
-    ee_target_euler_xyz = (0.0, 0.0, 0.0)
+
+    # ✅ ZXY: (yaw, roll, pitch)
+    ee_target_euler_zxy = (0.0, 0.0, 0.0)
 
     # -----------------
     # Random EE target
@@ -89,19 +92,26 @@ class MtrlAmEnvCfg(DirectRLEnvCfg):
     # -----------------
     # reward weights
     # -----------------
-    exp_pos_scale: float = 5.0
-    exp_rpy_scale: float = 5.0
-    exp_yaw_scale: float = 5.0
+    exp_pos_scale: float = 0.5
+    exp_rp_scale: float = 10.0
+    exp_yaw_scale: float = 1.0
     exp_action_smooth_scale: float = 1.0
 
-    w_ee_pos: float = 0.45
-    w_ee_rp: float = 0.3
-    w_ee_yaw: float = 0.15
+    w_ee_pos: float = 0.5
+    w_ee_rp: float = 0.2
+    w_ee_yaw: float = 0.1
     w_action_smooth: float = 0.1
 
-    # desired(=commanded) reward mixing weight: 0이면 actual만, 1이면 desired만
-    reward_des_weight: float = 0.1
+    reward_des_weight: float = 0.0
 
+    # -----------------
+    # base tracking reward (ref vs actual)
+    # -----------------
+    exp_base_pos_scale: float = 0.5     # exp(-s * ||p - p_ref||^2)
+    exp_base_yaw_scale: float = 1.0     # exp(-s * (yaw - yaw_ref)^2)
+
+    w_base_pos: float = 0.05
+    w_base_yaw: float = 0.05
 
     # termination safety
     terminate_base_far = 10.0
@@ -110,7 +120,6 @@ class MtrlAmEnvCfg(DirectRLEnvCfg):
     # -----------------
     # simulation
     # -----------------
-    # NOTE: policy/controller Hz를 바꾸려면 여기 dt를 바꾸세요.
     sim: SimulationCfg = SimulationCfg(dt=1 / 60, render_interval=1)
 
     # -----------------
@@ -134,7 +143,9 @@ class MtrlAmEnvCfg(DirectRLEnvCfg):
     quad_path = "/home/yubinkim/workspace/mtrl_am/source/mtrl_am/mtrl_am/tasks/direct/mtrl_am/models/quad_mod.usd"
 
     init_pos = (0.0, 0.0, 1.0)
-    init_euler_xyz = (0.0, 0.0, 0.0)
+
+    # ✅ ZXY: (yaw, roll, pitch)
+    init_euler_zxy = (0.0, 0.0, 0.0)
 
     stiffness_dict = {
         "Joint_1": 5000.0,
@@ -166,7 +177,7 @@ class MtrlAmEnvCfg(DirectRLEnvCfg):
         },
         init_state=ArticulationCfg.InitialStateCfg(
             pos=init_pos,
-            rot=(1.0, 0.0, 0.0, 0.0),  # wxyz
+            rot=(1.0, 0.0, 0.0, 0.0),  # wxyz (실제 초기자세는 env에서 init_euler_zxy로 계산)
             joint_pos={"Joint_1": 0.0, "Joint_2": 0.0},
         ),
     )
@@ -183,7 +194,6 @@ class MtrlAmEnvCfg(DirectRLEnvCfg):
             pass
 
         self.scene.num_envs = int(self.num_envs)
-        # decimation=1이면 render_interval도 1
         self.sim.render_interval = int(self.decimation)
 
         assert len(self.dh_params) == 4 and all(len(r) == 4 for r in self.dh_params), \
